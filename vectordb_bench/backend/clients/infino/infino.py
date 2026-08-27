@@ -17,6 +17,16 @@ log = logging.getLogger(__name__)
 _VECTOR_FIELD = "emb"
 _ID_FIELD = "id"
 
+# VectorDBBench feeds rows in small batches (its default is 100 rows), and each
+# Infino append() commits a superfile. Committing one superfile per fed batch
+# would fragment a large load into thousands of tiny superfiles, making both the
+# load and the following optimize pathologically slow. insert_embeddings instead
+# buffers fed rows and commits them as one combined append once this many have
+# accumulated; the remainder is flushed when the load's init() scope exits, so a
+# corpus smaller than this threshold is still fully persisted. The result is a
+# handful of large superfiles regardless of the harness batch size.
+_FLUSH_ROWS = 100_000
+
 
 class Infino(VectorDB):
     """VectorDBBench client for Infino, an embedded vector/search engine.
@@ -66,6 +76,10 @@ class Infino(VectorDB):
         # when the table is empty — the load-phase open) and after unpickling.
         self._map_keys = None
         self._map_vals = None
+        # Rows accumulated by insert_embeddings as Arrow batches, committed as one
+        # large append at _FLUSH_ROWS and when the load's init() scope exits.
+        self._buf_batches: list[pa.RecordBatch] = []
+        self._buf_rows = 0
         # Build the schema once so table creation and every append stay in lockstep.
         self._schema = self._build_schema()
 
@@ -119,8 +133,19 @@ class Infino(VectorDB):
         return infino.connect(self.data_path, **self._connect_opts)
 
     def __getstate__(self) -> dict:
-        # Drop the non-picklable live connection so the instance can cross a process boundary.
-        return {**self.__dict__, "_conn": None, "_table": None, "_map_keys": None, "_map_vals": None}
+        # Drop the non-picklable live connection so the instance can cross a
+        # process boundary. The buffer is always empty at a process boundary
+        # (the load subprocess flushes at init() exit before returning), so it
+        # is reset rather than shipped.
+        return {
+            **self.__dict__,
+            "_conn": None,
+            "_table": None,
+            "_map_keys": None,
+            "_map_vals": None,
+            "_buf_batches": [],
+            "_buf_rows": 0,
+        }
 
     def _build_schema(self) -> pa.Schema:
         return pa.schema(
@@ -143,7 +168,14 @@ class Infino(VectorDB):
         if self._table is None:
             self._table = self._conn.open_table(self.table_name)
             self._load_or_build_id_map()
-        yield
+        try:
+            yield
+        finally:
+            # Commit any rows still buffered from the load. This runs in the same
+            # (sub)process that inserted them, before it returns — the only point
+            # at which a load smaller than _FLUSH_ROWS would otherwise never be
+            # persisted. A no-op outside the load path (the buffer is empty).
+            self._flush()
 
     # _id -> dataset-id translation, the same build-once / persist / reload
     # pattern the engine's own bench uses for its ground-truth bin: one scan
@@ -229,16 +261,37 @@ class Infino(VectorDB):
         metadata: list[int],
         **kwargs,
     ) -> tuple[int, Exception | None]:
+        # Buffer fed rows and commit them as a few large superfiles rather than
+        # one per call (see _FLUSH_ROWS); the remainder is flushed at init() exit
+        # so every fed row is persisted before search.
         try:
             arrays = [
                 pa.array(metadata, type=pa.int64()),
                 pa.array(embeddings, type=pa.list_(pa.float32(), self.dim)),
             ]
-            self._table.append(pa.record_batch(arrays, schema=self._schema))
+            self._buf_batches.append(pa.record_batch(arrays, schema=self._schema))
+            self._buf_rows += len(metadata)
+            if self._buf_rows >= _FLUSH_ROWS:
+                self._flush()
         except Exception as e:
             log.exception("Failed to insert embeddings into Infino")
             return 0, e
         return len(metadata), None
+
+    def _flush(self) -> None:
+        """Commit all buffered rows as a single superfile and clear the buffer.
+
+        Concatenates the buffered batches into one contiguous batch so the load
+        commits large superfiles. Inserts are serialized (the client is not
+        thread-safe, so the runner drives a single worker), so no lock is needed.
+        """
+        if not self._buf_batches:
+            return
+        table = pa.Table.from_batches(self._buf_batches, schema=self._schema).combine_chunks()
+        for batch in table.to_batches():
+            self._table.append(batch)
+        self._buf_batches = []
+        self._buf_rows = 0
 
     def search_embedding(self, query: list[float], k: int = 100, **kwargs) -> list[int]:
         # Vector serving is engine-decided; the call carries no tuning kwargs.
