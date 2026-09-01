@@ -3,10 +3,11 @@ from pydantic import BaseModel, field_validator
 from vectordb_bench.backend.clients.api import DBCaseConfig, DBConfig, MetricType
 
 # Vector serving path, bridged to the engine's `vector.search_mode` config key
-# by the client before connect (see infino.py) — a config override, not a public
-# engine-API field. "hnsw_ivf" (default) builds + serves a resident HNSW graph
-# over the quantized vectors (automatic IVF fallback) — the path this client
-# benchmarks; "ivf" serves the reclaimable IVF scan.
+# by the client before connect (see infino.py) — deliberately a config override,
+# not a public engine-API field, so nothing goes vestigial if the engine default
+# changes later. "ivf" (default) serves the reclaimable IVF scan; "hnsw_ivf"
+# builds + serves a resident HNSW graph over the Sq16 vectors (automatic ivf
+# fallback).
 _SEARCH_MODES = ("ivf", "hnsw_ivf")
 
 # Infino distance metrics; all are distances where smaller means nearer.
@@ -41,15 +42,17 @@ class InfinoConfig(DBConfig):
 
 class InfinoIndexConfig(BaseModel, DBCaseConfig):
     metric_type: MetricType | None = None
-    # Serving path + beam are forwarded through the engine config file, not
-    # IndexSpec (see _SEARCH_MODES above). Default hnsw_ivf: the resident-HNSW
-    # path is what this client benchmarks.
+    # Probe width and rerank budget stay engine-decided (calibrated per table at
+    # optimize time); only the serving-path selector is forwarded, and it goes
+    # through the engine config file, not IndexSpec (see _SEARCH_MODES above).
+    # Default hnsw_ivf: the resident-HNSW path is what this client benchmarks.
     search_mode: str = "hnsw_ivf"
     # Serve-time HNSW beam for search_mode=hnsw_ivf, bridged to the engine's
     # vector.hnsw_ef_search config key (see infino.py). 0 (default) serves each
-    # query at the graph's stamped k->ef curve; a positive value fixes the beam,
-    # so sweeping ef across runs traces the recall/QPS curve of one built graph
-    # with no rebuild.
+    # query at the graph's stamped k->ef curve; a positive value overrides it
+    # with a fixed beam, so sweeping ef across runs traces the recall/latency
+    # curve of ONE built graph with no rebuild — the direct analog of how the
+    # curated leaderboard sweeps ZillizCloud's per-run `level`.
     ef: int = 0
 
     @field_validator("search_mode")

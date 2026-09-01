@@ -30,7 +30,7 @@ def _parse_kv_list(_ctx, _param, values) -> dict[str, str]:  # noqa: ANN001
     return parsed
 
 
-# Shared connection options for the vector command.
+# Connection options shared across the command's parameter set.
 _data_path_option = click.option(
     "--data-path", type=str, default="/tmp/vectordb_bench/infino", help="Infino catalog directory"
 )
@@ -81,8 +81,8 @@ class InfinoTypedDict(InfinoCommonTypedDict):
             default=0,
             help="Serve-time HNSW beam (search_mode=hnsw_ivf), bridged to "
             "vector.hnsw_ef_search. 0 (default) uses the graph's stamped k->ef "
-            "curve; a positive value fixes the beam. Sweep it across runs (one "
-            "value per run) to trace the recall/latency curve without a rebuild.",
+            "curve; a positive value fixes the beam. Sweep it across runs "
+            "(one value per run) to trace the recall/latency curve without a rebuild.",
         ),
     ]
 
@@ -95,6 +95,7 @@ def Infino(**parameters: Unpack[InfinoTypedDict]):
     run(
         db=DBTYPE,
         db_config=InfinoConfig(
+            db_label=parameters["db_label"],
             data_path=parameters["data_path"],
             table_name=parameters["table_name"],
             cache_budget_bytes=parameters["cache_budget_bytes"],
